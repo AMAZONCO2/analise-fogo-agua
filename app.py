@@ -18,9 +18,18 @@
 import os
 import datetime as dt
 import io
+import logging
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 import re
+
+# Configura logging para diagnóstico de queimadas
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # Carrega variáveis de ambiente do arquivo .env no início do script
 load_dotenv()
@@ -118,8 +127,13 @@ def read_geospatial_file(uploaded_file) -> gpd.GeoDataFrame | None:
 # Dados (NASA FIRMS)
 # =========================
 FIRMS_API_BASE = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
-SOURCES = ["VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT", "MODIS_NRT"]
-DAY_RANGE_MAX = 10  # limite da API
+ALL_SOURCES = {
+    "VIIRS_SNPP_NRT": "VIIRS – Suomi NPP",
+    "VIIRS_NOAA20_NRT": "VIIRS – NOAA-20",
+    "VIIRS_NOAA21_NRT": "VIIRS – NOAA-21",
+    "MODIS_NRT": "MODIS – Terra/Aqua",
+}
+DAY_RANGE_MAX = 5  # limite da API (máx. aceito pela FIRMS: 5 dias)
 
 def chunk_dates(start: dt.date, end: dt.date, step_days: int = DAY_RANGE_MAX):
     """Divide [start, end] em janelas de até step_days."""
@@ -142,50 +156,68 @@ def fetch_firms_data(
     map_key: str, 
     _region_gdf: gpd.GeoDataFrame, 
     start_date: dt.date, 
-    end_date: dt.date
+    end_date: dt.date,
+    sources: tuple[str, ...] = tuple(ALL_SOURCES.keys()),
 ) -> dict:
     """Busca dados da FIRMS para uma área e período, retorna dict com dados brutos e filtrados."""
     bbox = area_bbox_from_gdf(_region_gdf)
+    logger.info("=" * 60)
+    logger.info("FIRMS | Início da busca")
+    logger.info("FIRMS | Período: %s → %s", start_date, end_date)
+    logger.info("FIRMS | BBOX: %s", bbox)
+    logger.info("FIRMS | Fontes selecionadas: %s", sources)
+    logger.info("FIRMS | API Key (primeiros 8 chars): %s...", map_key[:8] if map_key else "VAZIA")
     dfs_all = []
 
-    for source in SOURCES:
+    for source in sources:
         for start_chunk, day_range in chunk_dates(start_date, end_date, DAY_RANGE_MAX):
             try:
                 url = f"{FIRMS_API_BASE}/{map_key}/{source}/{bbox}/{day_range}/{start_chunk.strftime('%Y-%m-%d')}"
+                logger.debug("FIRMS | REQUEST → %s", url)
                 r = requests.get(url, timeout=60)
+                logger.debug("FIRMS | RESPONSE status=%s, content_length=%s", r.status_code, len(r.text))
                 r.raise_for_status()
                 text = r.text.strip()
                 if not text or "\n" not in text:
+                    logger.warning("FIRMS | Resposta vazia ou sem quebra de linha para %s (chunk %s). Primeiros 200 chars: %s", source, start_chunk, text[:200])
                     continue
                 if "error" in text.lower() or "invalid" in text.lower():
+                    logger.warning("FIRMS | API retornou erro/invalid para '%s': %s", source, text[:200])
                     st.warning(f"API FIRMS retornou aviso para '{source}': {text[:100]}")
                     continue
                 
                 df_chunk = pd.read_csv(io.StringIO(text))
+                logger.info("FIRMS | %s | chunk %s | %d linhas | colunas: %s", source, start_chunk, len(df_chunk), list(df_chunk.columns))
                 if not df_chunk.empty:
                     df_chunk["firms_source"] = source
                     dfs_all.append(df_chunk)
 
             except requests.HTTPError as e:
+                logger.error("FIRMS | HTTPError para %s (chunk %s): status=%s, body=%s", source, start_chunk, e.response.status_code, e.response.text[:300])
                 # Silencioso se for 404 (sem dados), erro para outros
                 if e.response.status_code != 404:
                     st.error(f"Erro HTTP na API FIRMS ({source}): {e}")
                 continue # Pula para próxima fonte/data
             except Exception as e:
+                logger.exception("FIRMS | Exceção inesperada para %s (chunk %s)", source, start_chunk)
                 st.error(f"Falha ao processar dados da FIRMS ({source}): {e}")
                 continue
     
     empty_result = {"raw": pd.DataFrame(), "filtered": pd.DataFrame()}
     if not dfs_all:
+        logger.warning("FIRMS | Nenhum dado coletado de nenhuma fonte. Retornando vazio.")
         return empty_result
 
     raw_df = pd.concat(dfs_all, ignore_index=True)
+    logger.info("FIRMS | Total bruto (raw) após concat: %d linhas", len(raw_df))
     
     # Normaliza nomes de colunas
     raw_df.rename(columns={c: c.lower() for c in raw_df.columns}, inplace=True)
+    logger.debug("FIRMS | Colunas normalizadas: %s", list(raw_df.columns))
     
     # Filtro espacial preciso (dentro do polígono)
     if "latitude" not in raw_df.columns or "longitude" not in raw_df.columns:
+        logger.error("FIRMS | Colunas 'latitude'/'longitude' NÃO encontradas! Colunas disponíveis: %s", list(raw_df.columns))
         st.error("Resposta da FIRMS não contém colunas 'latitude' ou 'longitude'.")
         return empty_result # Retorna DF vazio se não houver coordenadas
 
@@ -194,6 +226,8 @@ def fetch_firms_data(
     
     region_geom = _region_gdf.unary_union
     inside_mask = gdf_pts.within(region_geom)
+    
+    logger.info("FIRMS | Filtro espacial: %d de %d pontos dentro do polígono", inside_mask.sum(), len(gdf_pts))
     
     result_gdf = gdf_pts.loc[inside_mask].copy()
     
@@ -205,6 +239,8 @@ def fetch_firms_data(
         result_gdf.drop_duplicates(inplace=True, ignore_index=True)
 
     filtered_df = pd.DataFrame(result_gdf.drop(columns=["geometry"]))
+    logger.info("FIRMS | Resultado final: raw=%d, filtered=%d", len(raw_df), len(filtered_df))
+    logger.info("=" * 60)
     return {"raw": raw_df, "filtered": filtered_df}
 
 
@@ -384,7 +420,7 @@ def display_rain_analysis(rain_df: pd.DataFrame, start_date: dt.date, end_date: 
     )
     
     with st.expander("Ver tabela de dados de precipitação"):
-        st.dataframe(rain_df, use_container_width=True, hide_index=True)
+        st.dataframe(rain_df, width='stretch', hide_index=True)
         fname_part = sanitize_filename(area_name) or f"{st.session_state.lat:.4f}_{st.session_state.lon:.4f}"
         st.download_button(
             "⬇️ Baixar CSV", data=csv_bytes(rain_df),
@@ -395,13 +431,15 @@ def display_firms_analysis(firms_data: dict, start_date: dt.date, end_date: dt.d
     """Exibe métricas, mapa e gráficos para um DataFrame de queimadas."""
     firms_df = firms_data.get("filtered", pd.DataFrame())
     firms_df_raw = firms_data.get("raw", pd.DataFrame())
+    logger.info("DISPLAY_FIRMS | raw=%d, filtered=%d, período=%s→%s",
+                len(firms_df_raw), len(firms_df), start_date, end_date)
 
     if firms_df.empty:
         st.success("✅ Nenhum foco de queimada detectado na área e período selecionados.")
         if not firms_df_raw.empty:
             st.info(f"Foram encontrados {len(firms_df_raw)} focos na área de busca inicial (bounding box), mas nenhum dentro do polígono exato.")
             with st.expander("Ver dados brutos (antes do filtro espacial)"):
-                st.dataframe(firms_df_raw, use_container_width=True, hide_index=True)
+                st.dataframe(firms_df_raw, width='stretch', hide_index=True)
                 fname_part = sanitize_filename(area_name) or "area-selecionada"
                 st.download_button(
                     "⬇️ Baixar CSV Bruto (sem filtro espacial)", data=csv_bytes(firms_df_raw),
@@ -437,7 +475,7 @@ def display_firms_analysis(firms_data: dict, start_date: dt.date, end_date: dt.d
     )
 
     with st.expander("Ver tabela de dados de queimadas"):
-        st.dataframe(firms_df, use_container_width=True, hide_index=True)
+        st.dataframe(firms_df, width='stretch', hide_index=True)
         fname_part = sanitize_filename(area_name) or "area-selecionada"
         st.download_button(
             "⬇️ Baixar CSV Filtrado", data=csv_bytes(firms_df),
@@ -455,13 +493,14 @@ def display_single_year_firms_detail(firms_data: dict, year: str, region_gdf: gp
     """Exibe uma análise detalhada de queimadas para um único ano, com detalhamento mensal."""
     firms_df = firms_data.get("filtered", pd.DataFrame())
     firms_df_raw = firms_data.get("raw", pd.DataFrame())
+    logger.info("DISPLAY_YEAR | ano=%s, raw=%d, filtered=%d", year, len(firms_df_raw), len(firms_df))
 
     if firms_df.empty:
         st.success(f"✅ Nenhum foco de queimada detectado na área para o ano de {year}.")
         if not firms_df_raw.empty:
             st.info(f"Foram encontrados {len(firms_df_raw)} focos na área de busca inicial (bounding box), mas nenhum dentro do polígono exato.")
             with st.expander("Ver dados brutos do ano (antes do filtro espacial)"):
-                st.dataframe(firms_df_raw, use_container_width=True, hide_index=True)
+                st.dataframe(firms_df_raw, width='stretch', hide_index=True)
                 fname_part = sanitize_filename(area_name) or "area-selecionada"
                 st.download_button(
                     "⬇️ Baixar CSV Bruto do Ano Completo", data=csv_bytes(firms_df_raw),
@@ -522,10 +561,10 @@ def display_single_year_firms_detail(firms_data: dict, year: str, region_gdf: gp
     )
 
     with st.expander("Ver tabela de dados mensais"):
-        st.dataframe(summary_df.set_index("Mês"), use_container_width=True)
+        st.dataframe(summary_df.set_index("Mês"), width='stretch')
 
     with st.expander("Ver tabela de todos os focos do ano"):
-        st.dataframe(firms_df, use_container_width=True, hide_index=True)
+        st.dataframe(firms_df, width='stretch', hide_index=True)
         fname_part = sanitize_filename(area_name) or "area-selecionada"
         st.download_button(
             "⬇️ Baixar CSV Filtrado do Ano Completo", data=csv_bytes(firms_df),
@@ -542,6 +581,10 @@ def display_single_year_firms_detail(firms_data: dict, year: str, region_gdf: gp
 def display_combined_analysis(rain_df: pd.DataFrame, firms_data: dict, start_date: dt.date, end_date: dt.date, area_name: str):
     """Exibe gráfico e tabela combinando chuva e queimadas."""
     firms_df = firms_data.get("filtered")
+    logger.info("DISPLAY_COMBINED | rain=%d, firms_filtered=%s, período=%s→%s",
+                len(rain_df),
+                len(firms_df) if firms_df is not None else "None",
+                start_date, end_date)
     if rain_df.empty and (firms_df is None or firms_df.empty):
         st.warning("Nenhum dado para análise combinada.")
         return
@@ -561,7 +604,7 @@ def display_combined_analysis(rain_df: pd.DataFrame, firms_data: dict, start_dat
     full_date_range = pd.date_range(start=start_date, end=end_date, freq="D")
     combined_df = pd.DataFrame(index=full_date_range)
     combined_df = combined_df.join(rain_df["precip_mm"]).join(daily_counts["fire_count"])
-    combined_df.fillna(0, inplace=True)
+    combined_df = combined_df.fillna(0).infer_objects(copy=False)
     combined_df.reset_index(inplace=True)
     combined_df.rename(columns={"index": "date"}, inplace=True)
 
@@ -585,7 +628,7 @@ def display_combined_analysis(rain_df: pd.DataFrame, firms_data: dict, start_dat
     )
     
     with st.expander("Ver tabela de dados combinados"):
-        st.dataframe(combined_df, use_container_width=True, hide_index=True)
+        st.dataframe(combined_df, width='stretch', hide_index=True)
         fname_part = sanitize_filename(area_name) or "area-selecionada"
         st.download_button(
             "⬇️ Baixar CSV", data=csv_bytes(combined_df),
@@ -659,7 +702,7 @@ def display_annual_rain(analysis_results: list, mes_nome: str):
         
         st.altair_chart(line_chart, use_container_width=True)
         with st.expander("Ver dados mensais detalhados"):
-            st.dataframe(full_monthly_df[['year', 'month_abbr', 'precip_mm']], use_container_width=True)
+            st.dataframe(full_monthly_df[['year', 'month_abbr', 'precip_mm']], width='stretch')
 
 
 def display_annual_firms(analysis_results: list, mes_nome: str):
@@ -741,7 +784,7 @@ def display_annual_firms(analysis_results: list, mes_nome: str):
         
         st.altair_chart(line_chart, use_container_width=True)
         with st.expander("Ver dados mensais detalhados de focos"):
-            st.dataframe(monthly_counts[['year', 'month_abbr', 'focos']], use_container_width=True)
+            st.dataframe(monthly_counts[['year', 'month_abbr', 'focos']], width='stretch')
 
 
 def display_annual_combined(analysis_results: list, mes_nome: str):
@@ -806,6 +849,14 @@ with st.sidebar:
 
     st.divider()
     st.header("🗓️ 2. Período e API")
+
+    # Seleção de Tipos de Dados
+    data_types = st.multiselect(
+        "Selecione os dados para análise",
+        ["Precipitação", "Focos de Queimada"],
+        default=["Precipitação", "Focos de Queimada"],
+        help="Escolha um ou ambos os tipos de dados para visualizar."
+    )
     
     analysis_mode = st.radio(
         "Selecione o modo de análise",
@@ -821,6 +872,18 @@ with st.sidebar:
         )
     else:
         st.success("Chave da API FIRMS carregada da variável de ambiente.")
+
+    # Seleção de satélites FIRMS
+    st.subheader("🛰️ Satélites FIRMS")
+    selected_labels = st.multiselect(
+        "Selecione as fontes de satélite",
+        options=list(ALL_SOURCES.values()),
+        default=list(ALL_SOURCES.values()),
+        help="Escolha quais satélites usar para detectar focos de queimada.",
+    )
+    # Converte labels legíveis de volta para os códigos da API
+    _label_to_key = {v: k for k, v in ALL_SOURCES.items()}
+    selected_sources = tuple(_label_to_key[lbl] for lbl in selected_labels)
 
     today = today_local()
     periods_to_fetch = []
@@ -883,7 +946,7 @@ with st.sidebar:
                 end_date = today
             periods_to_fetch.append({"start": start_date, "end": end_date, "label": label})
     
-    fetch_btn = st.button("🔎 Analisar período", use_container_width=True, type="primary")
+    fetch_btn = st.button("🔎 Analisar período", width='stretch', type="primary")
 
 # =========================
 # Corpo Principal do App
@@ -901,104 +964,139 @@ else:
 
 
 if fetch_btn:
+    if not data_types:
+        st.warning("Por favor, selecione pelo menos um tipo de dado (Precipitação ou Queimadas).")
+        st.stop()
+
     analysis_results = []
     try:
         for period in periods_to_fetch:
             with st.spinner(f"Buscando dados para {period['label']}..."):
-                # Precipitação é sempre buscada
-                rain_df = fetch_daily_rain_mm(st.session_state.lat, st.session_state.lon, period['start'], period['end'])
+                # Precipitação
+                rain_df = pd.DataFrame()
+                if "Precipitação" in data_types:
+                    rain_df = fetch_daily_rain_mm(st.session_state.lat, st.session_state.lon, period['start'], period['end'])
                 
                 firms_data = {"raw": pd.DataFrame(), "filtered": pd.DataFrame()}
-                # Queimadas são buscadas se uma região for fornecida via arquivo
-                if st.session_state.region_gdf is not None and firms_api_key:
-                    firms_data = fetch_firms_data(firms_api_key, st.session_state.region_gdf, period['start'], period['end'])
+                
+                # Queimadas
+                should_fetch_fire = "Focos de Queimada" in data_types
+                
+                logger.info("MAIN | Período '%s': region_gdf=%s, firms_api_key=%s, fetch_fire=%s",
+                            period['label'],
+                            "OK" if st.session_state.region_gdf is not None else "NONE",
+                            "OK" if firms_api_key else "VAZIA",
+                            should_fetch_fire)
+                            
+                if should_fetch_fire and st.session_state.region_gdf is not None and firms_api_key and selected_sources:
+                    logger.info("MAIN | Chamando fetch_firms_data para '%s' (%s → %s) | fontes=%s", period['label'], period['start'], period['end'], selected_sources)
+                    firms_data = fetch_firms_data(firms_api_key, st.session_state.region_gdf, period['start'], period['end'], sources=selected_sources)
+                    logger.info("MAIN | Resultado para '%s': raw=%d, filtered=%d",
+                                period['label'],
+                                len(firms_data.get("raw", pd.DataFrame())),
+                                len(firms_data.get("filtered", pd.DataFrame())))
+                else:
+                    logger.warning("MAIN | Busca de queimadas PULADA para '%s' (User selected? %s)", period['label'], should_fetch_fire)
                 
                 analysis_results.append({"rain_df": rain_df, "firms_data": firms_data, "period": period})
     except Exception as e:
         st.error(f"Ocorreu um erro durante a busca de dados: {e}")
         st.stop()
 
-    tab1, tab2, tab3 = st.tabs(["💧 Precipitação", "🔥 Queimadas", "📈 Combinado"])
+    # Definição dinâmica das abas
+    tabs_map = {}
+    if "Precipitação" in data_types:
+        tabs_map["rain"] = "💧 Precipitação"
+    if "Focos de Queimada" in data_types:
+        tabs_map["fire"] = "🔥 Queimadas"
+    if "Precipitação" in data_types and "Focos de Queimada" in data_types:
+        tabs_map["combined"] = "📈 Combinado"
+        
+    tabs_objs = st.tabs(list(tabs_map.values()))
+    tabs_dict = dict(zip(tabs_map.keys(), tabs_objs))
 
     # --- ABA 1: PRECIPITAÇÃO ---
-    with tab1:
-        if analysis_mode in ["Mês Único", "Análise Anual Específica"]:
-            res = analysis_results[0]
-            display_rain_analysis(res["rain_df"], res["period"]["start"], res["period"]["end"], area_name)
-        
-        elif analysis_mode == "Comparativo Mensal":
-            st.header("Comparativo de Precipitação")
-            c1, c2 = st.columns(2)
-            res1, res2 = analysis_results[0], analysis_results[1]
-            with c1:
-                st.subheader(f"Mês A: {res1['period']['label']}")
-                display_rain_analysis(res1["rain_df"], res1["period"]["start"], res1["period"]["end"], area_name)
-            with c2:
-                st.subheader(f"Mês B: {res2['period']['label']}")
-                display_rain_analysis(res2["rain_df"], res2["period"]["start"], res2["period"]["end"], area_name)
-        
-        elif analysis_mode == "Comparativo Anual":
-            st.header(f"Comparativo Anual de Precipitação para: {mes_nome}")
-            display_annual_rain(analysis_results, mes_nome)
-
-    # --- ABA 2: QUEIMADAS ---
-    with tab2:
-        if st.session_state.region_gdf is None:
-            st.warning("Upload de shapefile/GeoJSON necessário para análise de queimadas.")
-        elif not firms_api_key:
-            st.error("Chave da API da FIRMS necessária.")
-        else:
-            if analysis_mode == "Mês Único":
-                res = analysis_results[0]
-                display_firms_analysis(res["firms_data"], res["period"]["start"], res["period"]["end"], st.session_state.region_gdf, area_name)
-            
-            elif analysis_mode == "Análise Anual Específica":
-                res = analysis_results[0]
-                display_single_year_firms_detail(res["firms_data"], res["period"]["label"], st.session_state.region_gdf, area_name)
-
-            elif analysis_mode == "Comparativo Mensal":
-                st.header("Comparativo de Queimadas")
-                c1, c2 = st.columns(2)
-                res1, res2 = analysis_results[0], analysis_results[1]
-                with c1:
-                    st.subheader(f"Mês A: {res1['period']['label']}")
-                    display_firms_analysis(res1["firms_data"], res1["period"]["start"], res1["period"]["end"], st.session_state.region_gdf, area_name)
-                with c2:
-                    st.subheader(f"Mês B: {res2['period']['label']}")
-                    display_firms_analysis(res2["firms_data"], res2["period"]["start"], res2["period"]["end"], st.session_state.region_gdf, area_name)
-            
-            elif analysis_mode == "Comparativo Anual":
-                st.header(f"Comparativo Anual de Queimadas para: {mes_nome}")
-                display_annual_firms(analysis_results, mes_nome)
-
-    # --- ABA 3: COMBINADO ---
-    with tab3:
-        if st.session_state.region_gdf is None:
-            st.warning("Upload de shapefile/GeoJSON necessário para análise combinada.")
-        elif not firms_api_key:
-            st.error("Chave da API da FIRMS necessária.")
-        else:
+    if "rain" in tabs_dict:
+        with tabs_dict["rain"]:
             if analysis_mode in ["Mês Único", "Análise Anual Específica"]:
                 res = analysis_results[0]
-                display_combined_analysis(res["rain_df"], res["firms_data"], res["period"]["start"], res["period"]["end"], area_name)
+                display_rain_analysis(res["rain_df"], res["period"]["start"], res["period"]["end"], area_name)
             
             elif analysis_mode == "Comparativo Mensal":
-                st.header("Comparativo Combinado: Chuva vs. Queimadas")
+                st.header("Comparativo de Precipitação")
                 c1, c2 = st.columns(2)
                 res1, res2 = analysis_results[0], analysis_results[1]
                 with c1:
                     st.subheader(f"Mês A: {res1['period']['label']}")
-                    display_combined_analysis(res1["rain_df"], res1["firms_data"], res1["period"]["start"], res1["period"]["end"], area_name)
+                    display_rain_analysis(res1["rain_df"], res1["period"]["start"], res1["period"]["end"], area_name)
                 with c2:
                     st.subheader(f"Mês B: {res2['period']['label']}")
-                    display_combined_analysis(res2["rain_df"], res2["firms_data"], res2["period"]["start"], res2["period"]["end"], area_name)
-
+                    display_rain_analysis(res2["rain_df"], res2["period"]["start"], res2["period"]["end"], area_name)
+            
             elif analysis_mode == "Comparativo Anual":
-                st.header(f"Comparativo Anual Combinado para: {mes_nome}")
-                display_annual_combined(analysis_results, mes_nome)
+                st.header(f"Comparativo Anual de Precipitação para: {mes_nome}")
+                display_annual_rain(analysis_results, mes_nome)
 
-else:
-    st.info("Selecione uma área, período e clique em 'Analisar' na barra lateral.")
+    # --- ABA 2: QUEIMADAS ---
+    if "fire" in tabs_dict:
+        with tabs_dict["fire"]:
+            if st.session_state.region_gdf is None:
+                st.warning("Upload de shapefile/GeoJSON necessário para análise de queimadas.")
+            elif not firms_api_key:
+                st.error("Chave da API da FIRMS necessária.")
+            else:
+                if analysis_mode == "Mês Único":
+                    res = analysis_results[0]
+                    display_firms_analysis(res["firms_data"], res["period"]["start"], res["period"]["end"], st.session_state.region_gdf, area_name)
+                
+                elif analysis_mode == "Análise Anual Específica":
+                    res = analysis_results[0]
+                    display_single_year_firms_detail(res["firms_data"], res["period"]["label"], st.session_state.region_gdf, area_name)
+
+                elif analysis_mode == "Comparativo Mensal":
+                    st.header("Comparativo de Queimadas")
+                    c1, c2 = st.columns(2)
+                    res1, res2 = analysis_results[0], analysis_results[1]
+                    with c1:
+                        st.subheader(f"Mês A: {res1['period']['label']}")
+                        display_firms_analysis(res1["firms_data"], res1["period"]["start"], res1["period"]["end"], st.session_state.region_gdf, area_name)
+                    with c2:
+                        st.subheader(f"Mês B: {res2['period']['label']}")
+                        display_firms_analysis(res2["firms_data"], res2["period"]["start"], res2["period"]["end"], st.session_state.region_gdf, area_name)
+                
+                elif analysis_mode == "Comparativo Anual":
+                    st.header(f"Comparativo Anual de Queimadas para: {mes_nome}")
+                    display_annual_firms(analysis_results, mes_nome)
+
+    # --- ABA 3: COMBINADO ---
+    if "combined" in tabs_dict:
+        with tabs_dict["combined"]:
+            if st.session_state.region_gdf is None:
+                st.warning("Upload de shapefile/GeoJSON necessário para análise combinada.")
+            elif not firms_api_key:
+                st.error("Chave da API da FIRMS necessária.")
+            else:
+                if analysis_mode in ["Mês Único", "Análise Anual Específica"]:
+                    res = analysis_results[0]
+                    display_combined_analysis(res["rain_df"], res["firms_data"], res["period"]["start"], res["period"]["end"], area_name)
+                
+                elif analysis_mode == "Comparativo Mensal":
+                    st.header("Comparativo Combinado: Chuva vs. Queimadas")
+                    c1, c2 = st.columns(2)
+                    res1, res2 = analysis_results[0], analysis_results[1]
+                    with c1:
+                        st.subheader(f"Mês A: {res1['period']['label']}")
+                        display_combined_analysis(res1["rain_df"], res1["firms_data"], res1["period"]["start"], res1["period"]["end"], area_name)
+                    with c2:
+                        st.subheader(f"Mês B: {res2['period']['label']}")
+                        display_combined_analysis(res2["rain_df"], res2["firms_data"], res2["period"]["start"], res2["period"]["end"], area_name)
+
+                elif analysis_mode == "Comparativo Anual":
+                    st.header(f"Comparativo Anual Combinado para: {mes_nome}")
+                    display_annual_combined(analysis_results, mes_nome)
+
+    else:
+        st.info("Selecione uma área, período e clique em 'Analisar' na barra lateral.")
 
 
 # Rodapé
