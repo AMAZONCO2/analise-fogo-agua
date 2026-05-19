@@ -19,6 +19,8 @@ import os
 import datetime as dt
 import io
 import logging
+import tempfile
+import zipfile
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 import re
@@ -97,29 +99,51 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[^\w-]', '', name)   # Remove caracteres não alfanuméricos (exceto hífens)
     return name
 
+def region_union(gdf: gpd.GeoDataFrame):
+    """União de todas as geometrias da região (compatível com GeoPandas recente)."""
+    return gdf.geometry.union_all()
+
 @st.cache_data(show_spinner="Lendo arquivo geoespacial...")
-def read_geospatial_file(uploaded_file) -> gpd.GeoDataFrame | None:
+def read_geospatial_file(file_bytes: bytes, fname: str) -> gpd.GeoDataFrame | None:
     """Lê um arquivo .zip (shapefile) ou .geojson e retorna um GeoDataFrame."""
-    if uploaded_file is None:
+    if not file_bytes:
         return None
-    
-    fname = uploaded_file.name
-    if fname.endswith(".zip"):
-        # Usa vfs para ler o shapefile de dentro do zip
-        gdf = gpd.read_file(f"zip://{fname}", vfs=f"zip://{uploaded_file.read()}")
-    elif fname.endswith(".geojson"):
-        gdf = gpd.read_file(uploaded_file)
-    else:
-        st.error("Formato de arquivo não suportado. Use .zip para shapefile ou .geojson.")
+
+    fname_lower = fname.lower()
+    try:
+        if fname_lower.endswith(".zip"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = os.path.join(tmpdir, os.path.basename(fname))
+                with open(zip_path, "wb") as f:
+                    f.write(file_bytes)
+
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(tmpdir)
+
+                shp_files = []
+                for root, _, files in os.walk(tmpdir):
+                    for file in files:
+                        if file.lower().endswith(".shp"):
+                            shp_files.append(os.path.join(root, file))
+                if not shp_files:
+                    return None
+                # Se houver mais de um .shp, usa o maior (evita camadas auxiliares)
+                shp_files.sort(key=lambda p: os.path.getsize(p), reverse=True)
+                gdf = gpd.read_file(shp_files[0])
+        elif fname_lower.endswith(".geojson"):
+            gdf = gpd.read_file(io.BytesIO(file_bytes))
+        else:
+            return None
+    except Exception:
+        logger.exception("Erro ao ler arquivo geoespacial: %s", fname)
         return None
 
     # Garante CRS WGS84
     if gdf.crs is None:
-        st.warning("O arquivo não tem um CRS definido. Assumindo WGS84 (EPSG:4326).")
         gdf = gdf.set_crs("EPSG:4326")
     elif gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs("EPSG:4326")
-    
+
     return gdf
 
 
@@ -178,8 +202,8 @@ def fetch_firms_data(
                 logger.debug("FIRMS | RESPONSE status=%s, content_length=%s", r.status_code, len(r.text))
                 r.raise_for_status()
                 text = r.text.strip()
-                if not text or "\n" not in text:
-                    logger.warning("FIRMS | Resposta vazia ou sem quebra de linha para %s (chunk %s). Primeiros 200 chars: %s", source, start_chunk, text[:200])
+                if not text:
+                    logger.debug("FIRMS | Resposta vazia para %s (chunk %s)", source, start_chunk)
                     continue
                 if "error" in text.lower() or "invalid" in text.lower():
                     logger.warning("FIRMS | API retornou erro/invalid para '%s': %s", source, text[:200])
@@ -187,10 +211,15 @@ def fetch_firms_data(
                     continue
                 
                 df_chunk = pd.read_csv(io.StringIO(text))
+                if df_chunk.empty:
+                    logger.debug(
+                        "FIRMS | %s | chunk %s | 0 focos (apenas cabeçalho CSV)",
+                        source, start_chunk,
+                    )
+                    continue
                 logger.info("FIRMS | %s | chunk %s | %d linhas | colunas: %s", source, start_chunk, len(df_chunk), list(df_chunk.columns))
-                if not df_chunk.empty:
-                    df_chunk["firms_source"] = source
-                    dfs_all.append(df_chunk)
+                df_chunk["firms_source"] = source
+                dfs_all.append(df_chunk)
 
             except requests.HTTPError as e:
                 logger.error("FIRMS | HTTPError para %s (chunk %s): status=%s, body=%s", source, start_chunk, e.response.status_code, e.response.text[:300])
@@ -224,7 +253,7 @@ def fetch_firms_data(
     pts = gpd.points_from_xy(raw_df["longitude"], raw_df["latitude"], crs="EPSG:4326")
     gdf_pts = gpd.GeoDataFrame(raw_df.copy(), geometry=pts)
     
-    region_geom = _region_gdf.unary_union
+    region_geom = region_union(_region_gdf)
     inside_mask = gdf_pts.within(region_geom)
     
     logger.info("FIRMS | Filtro espacial: %d de %d pontos dentro do polígono", inside_mask.sum(), len(gdf_pts))
@@ -839,13 +868,20 @@ with st.sidebar:
             accept_multiple_files=False,
         )
         if uploaded_file:
-            st.session_state.region_gdf = read_geospatial_file(uploaded_file)
+            st.session_state.region_gdf = read_geospatial_file(
+                uploaded_file.getvalue(), uploaded_file.name
+            )
             if st.session_state.region_gdf is not None:
                 st.success(f"Área carregada: {len(st.session_state.region_gdf)} polígonos.")
                 # Atualiza lat/lon com o centroide para visualização
-                centroid = st.session_state.region_gdf.unary_union.centroid
+                centroid = region_union(st.session_state.region_gdf).centroid
                 st.session_state.lat = centroid.y
                 st.session_state.lon = centroid.x
+            else:
+                st.error(
+                    "Não foi possível ler o arquivo. Verifique se o .zip contém um shapefile "
+                    "completo (.shp, .shx, .dbf e opcionalmente .prj) ou envie um .geojson."
+                )
 
     st.divider()
     st.header("🗓️ 2. Período e API")
