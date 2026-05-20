@@ -22,7 +22,6 @@ import logging
 import tempfile
 import zipfile
 from urllib.parse import urlencode
-from dotenv import load_dotenv
 import re
 
 # Configura logging para diagnóstico de queimadas
@@ -33,8 +32,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Carrega variáveis de ambiente do arquivo .env no início do script
-load_dotenv()
+def _load_local_env() -> None:
+    """Carrega .env localmente; no Streamlit Cloud usa Secrets (sem python-dotenv)."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+_load_local_env()
 
 import altair as alt
 import pandas as pd
@@ -46,6 +52,17 @@ import folium
 from folium.plugins import MarkerCluster
 import geopandas as gpd
 from shapely.geometry import shape
+
+
+def get_firms_api_key() -> str | None:
+    """Lê a chave FIRMS de variável de ambiente, Secrets do Streamlit ou .env local."""
+    key = os.getenv("FIRMS_MAP_KEY")
+    if key:
+        return key.strip()
+    try:
+        return str(st.secrets["FIRMS_MAP_KEY"]).strip()
+    except Exception:
+        return None
 
 
 # =========================
@@ -899,15 +916,15 @@ with st.sidebar:
         ["Mês Único", "Comparativo Mensal", "Análise Anual Específica", "Comparativo Anual"]
     )
 
-    # Pega a chave da variável de ambiente
-    firms_api_key = os.getenv("FIRMS_MAP_KEY")
+    firms_api_key = get_firms_api_key()
     if not firms_api_key:
         st.warning(
-            "A variável de ambiente `FIRMS_MAP_KEY` não está definida. "
+            "A chave `FIRMS_MAP_KEY` não está definida. "
+            "Configure em Secrets (Streamlit Cloud) ou no arquivo `.env` (local). "
             "A análise de queimadas não funcionará."
         )
     else:
-        st.success("Chave da API FIRMS carregada da variável de ambiente.")
+        st.success("Chave da API FIRMS carregada.")
 
     # Seleção de satélites FIRMS
     st.subheader("🛰️ Satélites FIRMS")
