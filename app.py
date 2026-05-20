@@ -47,7 +47,23 @@ import pandas as pd
 import requests
 import streamlit as st
 from dateutil.relativedelta import relativedelta
-from streamlit_folium import st_folium
+
+try:
+    from streamlit_folium import st_folium
+    HAS_STREAMLIT_FOLIUM = True
+except ImportError:
+    import streamlit.components.v1 as components
+    HAS_STREAMLIT_FOLIUM = False
+
+    def st_folium(m, width=None, height=400, returned_objects=None, **kwargs):
+        """Fallback quando streamlit-folium não está instalado (ex.: deploy incompleto)."""
+        components.html(m._repr_html_(), height=height or 400, scrolling=False)
+        return {}
+
+    logger.warning(
+        "Pacote 'streamlit-folium' não encontrado. Mapas exibidos sem clique interativo."
+    )
+
 import folium
 from folium.plugins import MarkerCluster
 import geopandas as gpd
@@ -855,7 +871,10 @@ with st.sidebar:
 
     if input_method == "Ponto no mapa":
         st.session_state.region_gdf = None # Limpa região se mudar de método
-        st.write("Clique no mapa para escolher a localização. Os campos acompanham o clique.")
+        if HAS_STREAMLIT_FOLIUM:
+            st.write("Clique no mapa para escolher a localização. Os campos acompanham o clique.")
+        else:
+            st.info("Informe latitude e longitude nos campos abaixo (clique no mapa indisponível neste ambiente).")
         m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=6, control_scale=True)
         folium.TileLayer("OpenStreetMap").add_to(m)
         folium.Marker(
