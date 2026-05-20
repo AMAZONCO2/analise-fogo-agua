@@ -43,10 +43,14 @@ def _load_local_env() -> None:
 _load_local_env()
 
 import altair as alt
+import folium
+from folium.plugins import MarkerCluster
+import geopandas as gpd
 import pandas as pd
 import requests
 import streamlit as st
 from dateutil.relativedelta import relativedelta
+from shapely.geometry import shape
 
 try:
     from streamlit_folium import st_folium
@@ -63,11 +67,6 @@ except ImportError:
     logger.warning(
         "Pacote 'streamlit-folium' não encontrado. Mapas exibidos sem clique interativo."
     )
-
-import folium
-from folium.plugins import MarkerCluster
-import geopandas as gpd
-from shapely.geometry import shape
 
 
 def get_firms_api_key() -> str | None:
